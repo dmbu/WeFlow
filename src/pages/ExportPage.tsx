@@ -1899,7 +1899,7 @@ const TaskCenterModal = memo(function TaskCenterModal({
                   ? `缓存命中 ${mediaCacheHitFiles}/${mediaCacheTotal}`
                   : ''
                 const mediaMissMetricLabel = mediaCacheMissFiles > 0
-                  ? `未导出 ${mediaCacheMissFiles} 个文件/媒体`
+                  ? `缓存未命中 ${mediaCacheMissFiles}`
                   : ''
                 const mediaDedupMetricLabel = mediaDedupReuseFiles > 0
                   ? `复用 ${mediaDedupReuseFiles}`
@@ -1914,7 +1914,7 @@ const TaskCenterModal = memo(function TaskCenterModal({
                   )
                   : ''
                 const mediaLiveMetricLabel = task.progress.phase === 'exporting-media'
-                  ? (mediaDoneFiles > 0 ? `已处理 ${mediaDoneFiles}` : '')
+                  ? (mediaDoneFiles > 0 ? `已写入 ${mediaDoneFiles}` : '')
                   : ''
                 const sessionProgressLabel = completedSessionTotal > 0
                   ? `会话 ${completedSessionCount}/${completedSessionTotal}`
@@ -2237,6 +2237,27 @@ function ExportPage() {
     displayNamePreference: 'remark',
     exportConcurrency: 2
   })
+
+  const exportStatsRangeOptions = useMemo(() => {
+    if (options.useAllTime || !options.dateRange) return null
+    const beginTimestamp = Math.floor(options.dateRange.start.getTime() / 1000)
+    const endTimestamp = Math.floor(options.dateRange.end.getTime() / 1000)
+    if (!Number.isFinite(beginTimestamp) || !Number.isFinite(endTimestamp)) return null
+    if (beginTimestamp <= 0 && endTimestamp <= 0) return null
+    return {
+      beginTimestamp: Math.max(0, beginTimestamp),
+      endTimestamp: Math.max(0, endTimestamp)
+    }
+  }, [options.useAllTime, options.dateRange])
+
+  const withExportStatsRange = useCallback((statsOptions: Record<string, any>): Record<string, any> => {
+    if (!exportStatsRangeOptions) return statsOptions
+    return {
+      ...statsOptions,
+      beginTimestamp: exportStatsRangeOptions.beginTimestamp,
+      endTimestamp: exportStatsRangeOptions.endTimestamp
+    }
+  }, [exportStatsRangeOptions])
 
   const [exportDialog, setExportDialog] = useState<ExportDialogState>({
     open: false,
@@ -4003,7 +4024,7 @@ function ExportPage() {
           const cacheResult = await withTimeout(
             window.electronAPI.chat.getExportSessionStats(
               batchSessionIds,
-              { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+              withExportStatsRange({ includeRelations: false, allowStaleCache: true, cacheOnly: true })
             ),
             12000,
             'cacheOnly'
@@ -4018,7 +4039,7 @@ function ExportPage() {
             const freshResult = await withTimeout(
               window.electronAPI.chat.getExportSessionStats(
                 missingSessionIds,
-                { includeRelations: false, allowStaleCache: true }
+                withExportStatsRange({ includeRelations: false, allowStaleCache: true })
               ),
               45000,
               'fresh'
@@ -4062,7 +4083,7 @@ function ExportPage() {
         void runSessionMediaMetricWorker(runId)
       }
     }
-  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
+  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage, withExportStatsRange])
 
   const scheduleSessionMediaMetricWorker = useCallback(() => {
     if (activeTaskCountRef.current > 0) return
@@ -7243,7 +7264,7 @@ function ExportPage() {
       try {
         const quickStatsResult = await window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+          withExportStatsRange({ includeRelations: false, allowStaleCache: true, cacheOnly: true })
         )
         if (requestSeq !== detailRequestSeqRef.current) return
         if (quickStatsResult.success) {
@@ -7270,7 +7291,7 @@ function ExportPage() {
       try {
         const relationCacheResult = await window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: true, allowStaleCache: true, cacheOnly: true }
+          withExportStatsRange({ includeRelations: true, allowStaleCache: true, cacheOnly: true })
         )
         if (requestSeq !== detailRequestSeqRef.current) return
         if (relationCacheResult.success && relationCacheResult.data) {
@@ -7295,7 +7316,7 @@ function ExportPage() {
             // 后台补齐非关系统计，不走精确特型扫描，避免阻塞列表统计队列。
             const freshResult = await window.electronAPI.chat.getExportSessionStats(
               [normalizedSessionId],
-              { includeRelations: false, forceRefresh: true }
+              withExportStatsRange({ includeRelations: false, forceRefresh: true })
             )
             if (requestSeq !== detailRequestSeqRef.current) return
             if (freshResult.success && freshResult.data) {
@@ -7330,7 +7351,7 @@ function ExportPage() {
         setIsLoadingSessionDetailExtra(false)
       }
     }
-  }, [applySessionDetailStats, contactByUsername, mergeSessionContentMetrics, sessionContentMetrics, sessionMessageCounts, sessionRowByUsername])
+  }, [applySessionDetailStats, contactByUsername, mergeSessionContentMetrics, sessionContentMetrics, sessionMessageCounts, sessionRowByUsername, withExportStatsRange])
 
   const loadSessionRelationStats = useCallback(async (options?: { forceRefresh?: boolean }) => {
     const normalizedSessionId = String(sessionDetail?.wxid || '').trim()
@@ -7343,7 +7364,7 @@ function ExportPage() {
       if (!forceRefresh) {
         const relationCacheResult = await window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: true, allowStaleCache: true, cacheOnly: true }
+          withExportStatsRange({ includeRelations: true, allowStaleCache: true, cacheOnly: true })
         )
         if (requestSeq !== detailRequestSeqRef.current) return
 
@@ -7361,7 +7382,7 @@ function ExportPage() {
 
       const relationResult = await window.electronAPI.chat.getExportSessionStats(
         [normalizedSessionId],
-        { includeRelations: true, forceRefresh, preferAccurateSpecialTypes: true }
+        withExportStatsRange({ includeRelations: true, forceRefresh, preferAccurateSpecialTypes: true })
       )
       if (requestSeq !== detailRequestSeqRef.current) return
 
@@ -7381,7 +7402,7 @@ function ExportPage() {
         setIsLoadingSessionRelationStats(false)
       }
     }
-  }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid])
+  }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid, withExportStatsRange])
 
   const handleRefreshTableData = useCallback(async () => {
     const scopeKey = await ensureExportCacheScope()

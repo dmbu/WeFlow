@@ -3445,10 +3445,10 @@ function ChatPage(props: ChatPageProps) {
       if (result.success && result.messages) {
         const resultMessages = result.messages
         if (offset === 0) {
+          setNoMessageTable(false)
           setMessages(resultMessages)
           persistSessionPreviewCache(sessionId, resultMessages)
           if (resultMessages.length === 0) {
-            setNoMessageTable(true)
             setHasMoreMessages(false)
           }
 
@@ -3549,7 +3549,10 @@ function ChatPage(props: ChatPageProps) {
           : offset + resultMessages.length
         setCurrentOffset(nextOffset)
       } else if (!result.success) {
-        setNoMessageTable(true)
+        const errorText = String(result.error || '')
+        const shouldMarkNoTable =
+          /schema mismatch|no message db|no table|消息数据库未找到|消息表|message schema/i.test(errorText)
+        setNoMessageTable(shouldMarkNoTable)
         setHasMoreMessages(false)
       }
     } catch (e) {
@@ -3557,6 +3560,7 @@ function ChatPage(props: ChatPageProps) {
       setConnectionError('加载消息失败')
       setHasMoreMessages(false)
       if (offset === 0 && currentSessionRef.current === sessionId) {
+        setNoMessageTable(false)
         setMessages([])
       }
     } finally {

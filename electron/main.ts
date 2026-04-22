@@ -2390,6 +2390,8 @@ function registerIpcHandlers() {
     allowStaleCache?: boolean
     preferAccurateSpecialTypes?: boolean
     cacheOnly?: boolean
+    beginTimestamp?: number
+    endTimestamp?: number
   }) => {
     return chatService.getExportSessionStats(sessionIds, options)
   })
@@ -3932,7 +3934,6 @@ app.on('window-all-closed', () => {
     app.quit()
   }
 })
-
 
 
 

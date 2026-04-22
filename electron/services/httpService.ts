@@ -516,27 +516,29 @@ class HttpService {
     limit: number,
     startTime: number,
     endTime: number,
-    ascending: boolean
+    ascending: boolean,
+    useLiteMapping: boolean = true
   ): Promise<{ success: boolean; messages?: Message[]; hasMore?: boolean; error?: string }> {
     try {
-      // 使用固定 batch 大小（与 limit 相同或最多 500）来减少循环次数
-      const batchSize = Math.min(limit, 500)
+      // 深分页时放大 batch，避免 offset 很大时出现大量小批次循环。
+      const batchSize = Math.min(2000, Math.max(500, limit))
       const beginTimestamp = startTime > 10000000000 ? Math.floor(startTime / 1000) : startTime
       const endTimestamp = endTime > 10000000000 ? Math.floor(endTime / 1000) : endTime
 
-      const cursorResult = await wcdbService.openMessageCursor(talker, batchSize, ascending, beginTimestamp, endTimestamp)
+      const cursorResult = await wcdbService.openMessageCursorLite(talker, batchSize, ascending, beginTimestamp, endTimestamp)
       if (!cursorResult.success || !cursorResult.cursor) {
         return { success: false, error: cursorResult.error || '打开消息游标失败' }
       }
 
       const cursor = cursorResult.cursor
       try {
-        const allRows: Record<string, any>[] = []
+        const collectedRows: Record<string, any>[] = []
         let hasMore = true
         let skipped = 0
+        let reachedLimit = false
 
         // 循环获取消息，处理 offset 跳过 + limit 累积
-        while (allRows.length < limit && hasMore) {
+        while (collectedRows.length < limit && hasMore) {
           const batch = await wcdbService.fetchMessageBatch(cursor)
           if (!batch.success || !batch.rows || batch.rows.length === 0) {
             hasMore = false
@@ -557,12 +559,20 @@ class HttpService {
             skipped = offset
           }
 
-          allRows.push(...rows)
+          const remainingCapacity = limit - collectedRows.length
+          if (rows.length > remainingCapacity) {
+            collectedRows.push(...rows.slice(0, remainingCapacity))
+            reachedLimit = true
+            break
+          }
+
+          collectedRows.push(...rows)
         }
 
-        const trimmedRows = allRows.slice(0, limit)
-        const finalHasMore = hasMore || allRows.length > limit
-        const messages = chatService.mapRowsToMessagesForApi(trimmedRows)
+        const finalHasMore = hasMore || reachedLimit
+        const messages = useLiteMapping
+          ? chatService.mapRowsToMessagesLiteForApi(collectedRows)
+          : chatService.mapRowsToMessagesForApi(collectedRows)
         await this.backfillMissingSenderUsernames(talker, messages)
         return { success: true, messages, hasMore: finalHasMore }
       } finally {
@@ -590,32 +600,70 @@ class HttpService {
     if (targets.length === 0) return
 
     const myWxid = (this.configService.get('myWxid') || '').trim()
-    for (const msg of targets) {
-      const localId = Number(msg.localId || 0)
-      if (Number.isFinite(localId) && localId > 0) {
-        try {
-          const detail = await wcdbService.getMessageById(talker, localId)
-          if (detail.success && detail.message) {
-            const hydrated = chatService.mapRowsToMessagesForApi([detail.message])[0]
-            if (hydrated?.senderUsername) {
-              msg.senderUsername = hydrated.senderUsername
-            }
-            if ((msg.isSend === null || msg.isSend === undefined) && hydrated?.isSend !== undefined) {
-              msg.isSend = hydrated.isSend
-            }
-            if (!msg.rawContent && hydrated?.rawContent) {
-              msg.rawContent = hydrated.rawContent
-            }
-          }
-        } catch (error) {
-          console.warn('[HttpService] backfill sender failed:', error)
+    const MAX_DETAIL_BACKFILL = 120
+    if (targets.length > MAX_DETAIL_BACKFILL) {
+      for (const msg of targets) {
+        if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
+          msg.senderUsername = myWxid
         }
       }
+      return
+    }
 
-      if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
-        msg.senderUsername = myWxid
+    const queue = [...targets]
+    const workerCount = Math.max(1, Math.min(6, queue.length))
+    const state = {
+      attempted: 0,
+      hydrated: 0,
+      consecutiveMiss: 0
+    }
+    const MAX_DETAIL_LOOKUPS = 80
+    const MAX_CONSECUTIVE_MISS = 36
+    const runWorker = async (): Promise<void> => {
+      while (queue.length > 0) {
+        if (state.attempted >= MAX_DETAIL_LOOKUPS) break
+        if (state.consecutiveMiss >= MAX_CONSECUTIVE_MISS && state.hydrated <= 0) break
+        const msg = queue.shift()
+        if (!msg) break
+
+        const localId = Number(msg.localId || 0)
+        if (Number.isFinite(localId) && localId > 0) {
+          state.attempted += 1
+          try {
+            const detail = await wcdbService.getMessageById(talker, localId)
+            if (detail.success && detail.message) {
+              const hydrated = chatService.mapRowsToMessagesForApi([detail.message])[0]
+              if (hydrated?.senderUsername) {
+                msg.senderUsername = hydrated.senderUsername
+              }
+              if ((msg.isSend === null || msg.isSend === undefined) && hydrated?.isSend !== undefined) {
+                msg.isSend = hydrated.isSend
+              }
+              if (!msg.rawContent && hydrated?.rawContent) {
+                msg.rawContent = hydrated.rawContent
+              }
+              if (msg.senderUsername) {
+                state.hydrated += 1
+                state.consecutiveMiss = 0
+              } else {
+                state.consecutiveMiss += 1
+              }
+            } else {
+              state.consecutiveMiss += 1
+            }
+          } catch (error) {
+            console.warn('[HttpService] backfill sender failed:', error)
+            state.consecutiveMiss += 1
+          }
+        }
+
+        if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
+          msg.senderUsername = myWxid
+        }
       }
     }
+
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()))
   }
 
   private parseBooleanParam(url: URL, keys: string[], defaultValue: boolean = false): boolean {
@@ -663,7 +711,7 @@ class HttpService {
     const talker = (url.searchParams.get('talker') || '').trim()
     const limit = this.parseIntParam(url.searchParams.get('limit'), 100, 1, 10000)
     const offset = this.parseIntParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER)
-    const keyword = (url.searchParams.get('keyword') || '').trim().toLowerCase()
+    const keyword = (url.searchParams.get('keyword') || '').trim()
     const startParam = url.searchParams.get('start')
     const endParam = url.searchParams.get('end')
     const chatlab = this.parseBooleanParam(url, ['chatlab'], false)
@@ -683,26 +731,41 @@ class HttpService {
 
     const startTime = this.parseTimeParam(startParam)
     const endTime = this.parseTimeParam(endParam, true)
-    const queryOffset = keyword ? 0 : offset
-    const queryLimit = keyword ? 10000 : limit
-
-    const result = await this.fetchMessagesBatch(talker, queryOffset, queryLimit, startTime, endTime, false)
-    if (!result.success || !result.messages) {
-      this.sendError(res, 500, result.error || 'Failed to get messages')
-      return
-    }
-
-    let messages = result.messages
-    let hasMore = result.hasMore === true
+    let messages: Message[] = []
+    let hasMore = false
 
     if (keyword) {
-      const filtered = messages.filter((msg) => {
-        const content = (msg.parsedContent || msg.rawContent || '').toLowerCase()
-        return content.includes(keyword)
-      })
-      const endIndex = offset + limit
-      hasMore = filtered.length > endIndex
-      messages = filtered.slice(offset, endIndex)
+      const searchLimit = Math.max(1, limit) + 1
+      const searchResult = await chatService.searchMessages(
+        keyword,
+        talker,
+        searchLimit,
+        offset,
+        startTime,
+        endTime
+      )
+      if (!searchResult.success || !searchResult.messages) {
+        this.sendError(res, 500, searchResult.error || 'Failed to search messages')
+        return
+      }
+      hasMore = searchResult.messages.length > limit
+      messages = hasMore ? searchResult.messages.slice(0, limit) : searchResult.messages
+    } else {
+      const result = await this.fetchMessagesBatch(
+        talker,
+        offset,
+        limit,
+        startTime,
+        endTime,
+        false,
+        !mediaOptions.enabled
+      )
+      if (!result.success || !result.messages) {
+        this.sendError(res, 500, result.error || 'Failed to get messages')
+        return
+      }
+      messages = result.messages
+      hasMore = result.hasMore === true
     }
 
     const mediaMap = mediaOptions.enabled
@@ -812,7 +875,7 @@ class HttpService {
     const endTime = endParam ? this.parseTimeParam(endParam, true) : 0
 
     try {
-      const result = await this.fetchMessagesBatch(sessionId, offset, limit, startTime, endTime, true)
+      const result = await this.fetchMessagesBatch(sessionId, offset, limit, startTime, endTime, true, true)
       if (!result.success || !result.messages) {
         this.sendError(res, 500, result.error || 'Failed to get messages')
         return
